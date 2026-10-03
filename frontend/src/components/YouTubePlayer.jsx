@@ -31,6 +31,13 @@ function loadYouTubeApi() {
   return apiPromise;
 }
 
+function isSeekDiscontinuity(previous, time, performanceTime) {
+  if (!previous) return false;
+  const elapsed = (performanceTime - previous.performanceTime) / 1000;
+  const expectedDelta = previous.isPlaying ? elapsed : 0;
+  return Math.abs(time - previous.time - expectedDelta) > 1.5;
+}
+
 export default function YouTubePlayer({ role, playback }) {
   const containerRef = useRef(null);
   const playerRef = useRef(null);
@@ -39,6 +46,7 @@ export default function YouTubePlayer({ role, playback }) {
   const serverOffsetMsRef = useRef(0);
   const clockOffsetInitializedRef = useRef(false);
   const pendingSyncRef = useRef(null);
+  const pendingLocalSeekRef = useRef(null);
   const lastSampleRef = useRef(null);
   const lastAppliedPlaybackRef = useRef(null);
   const playbackRateRef = useRef(1);
@@ -55,7 +63,11 @@ export default function YouTubePlayer({ role, playback }) {
   const canControl = role === "host" || role === "moderator";
 
   roleRef.current = role;
-  playbackRef.current = playback;
+  if (pendingLocalSeekRef.current
+    && playback?.updatedAt !== pendingLocalSeekRef.current.previousUpdatedAt) {
+    pendingLocalSeekRef.current = null;
+  }
+  if (!pendingLocalSeekRef.current) playbackRef.current = playback;
 
   const getTargetTime = useCallback((state) => {
     if (!state) return 0;
@@ -139,6 +151,39 @@ export default function YouTubePlayer({ role, playback }) {
     }
   }, [getTargetTime]);
 
+  const publishManualSeek = useCallback((time, isPlaying) => {
+    if (!Number.isFinite(time) || !playbackRef.current?.videoId) return;
+    const performanceTime = performance.now();
+    const serverTime = Date.now() + serverOffsetMsRef.current;
+    const authoritative = {
+      ...playbackRef.current,
+      currentTime: time,
+      isPlaying,
+      updatedAt: serverTime,
+      serverTime,
+      sourceUserId: socket.id,
+      sourceAction: "seek",
+    };
+
+    pendingLocalSeekRef.current = {
+      previousUpdatedAt: playbackRef.current.updatedAt,
+    };
+    playbackRef.current = authoritative;
+    lastAppliedPlaybackRef.current = `${authoritative.videoId}:${serverTime}`;
+    lastSampleRef.current = { time, performanceTime, isPlaying };
+    lastDriftCorrectionAtRef.current = performanceTime;
+    driftCorrectionArmedRef.current = false;
+    pendingSyncRef.current = {
+      expectedState: isPlaying ? window.YT.PlayerState.PLAYING : window.YT.PlayerState.PAUSED,
+      expiresAt: Date.now() + 5000,
+    };
+    if (playbackRateRef.current !== 1) {
+      playerRef.current?.setPlaybackRate?.(1);
+      playbackRateRef.current = 1;
+    }
+    socket.emit("playback", { action: "seek", time, isPlaying });
+  }, []);
+
   useEffect(() => {
     let disposed = false;
     loadYouTubeApi().then((YT) => {
@@ -146,7 +191,6 @@ export default function YouTubePlayer({ role, playback }) {
       playerRef.current = new YT.Player(containerRef.current, {
         width: "100%",
         height: "100%",
-        videoId: playbackRef.current?.videoId,
         playerVars: {
           rel: 0,
           modestbranding: 1,
@@ -185,6 +229,15 @@ export default function YouTubePlayer({ role, playback }) {
               return;
             }
             if (!roleRef.current || roleRef.current === "participant") return;
+            if (event.data === YT.PlayerState.PLAYING || event.data === YT.PlayerState.PAUSED) {
+              const time = Number(event.target.getCurrentTime());
+              const isPlaying = event.data === YT.PlayerState.PLAYING;
+              const performanceTime = performance.now();
+              if (isSeekDiscontinuity(lastSampleRef.current, time, performanceTime)) {
+                publishManualSeek(time, isPlaying);
+                return;
+              }
+            }
             if (event.data === YT.PlayerState.PLAYING) {
               const time = event.target.getCurrentTime();
               socket.emit("playback", { action: "play", time });
@@ -246,7 +299,7 @@ export default function YouTubePlayer({ role, playback }) {
       playerRef.current?.destroy?.();
       playerRef.current = null;
     };
-  }, [syncPlayer]);
+  }, [publishManualSeek, syncPlayer]);
 
   useEffect(() => {
     const timers = new Map();
@@ -290,7 +343,19 @@ export default function YouTubePlayer({ role, playback }) {
       const performanceTime = performance.now();
       const previous = lastSampleRef.current;
       const authoritative = playbackRef.current;
-      const isLocalSource = authoritative?.sourceUserId === socket.id;
+
+      const isPlaying = state === window.YT.PlayerState.PLAYING;
+      if (roleRef.current !== "participant"
+        && (isPlaying || state === window.YT.PlayerState.PAUSED)
+        && isSeekDiscontinuity(previous, currentTime, performanceTime)) {
+        publishManualSeek(currentTime, isPlaying);
+        return;
+      }
+
+      if (pendingLocalSeekRef.current) {
+        lastSampleRef.current = { time: currentTime, performanceTime, isPlaying };
+        return;
+      }
 
       if (state === window.YT.PlayerState.PLAYING && authoritative?.isPlaying) {
         const drift = getTargetTime(authoritative) - currentTime;
@@ -325,29 +390,10 @@ export default function YouTubePlayer({ role, playback }) {
         restorePlaybackRate(player);
       }
 
-      if (roleRef.current !== "participant" && isLocalSource && previous
-        && (state === window.YT.PlayerState.PLAYING || state === window.YT.PlayerState.PAUSED)) {
-        const elapsed = (performanceTime - previous.performanceTime) / 1000;
-        const expectedDelta = previous.isPlaying ? elapsed : 0;
-        const drift = currentTime - previous.time - expectedDelta;
-        if (Math.abs(drift) > 0.75 && state === window.YT.PlayerState.PLAYING
-          && performanceTime - lastDriftCorrectionAtRef.current > 2500) {
-          socket.emit("playback", { action: "seek", time: currentTime, isPlaying: true });
-          lastDriftCorrectionAtRef.current = performanceTime;
-          lastSampleRef.current = { time: currentTime, performanceTime, isPlaying: true };
-          return;
-        } else if (state === window.YT.PlayerState.PAUSED && Math.abs(drift) > 0.75
-          && performanceTime - lastDriftCorrectionAtRef.current > 2500) {
-          socket.emit("playback", { action: "seek", time: currentTime, isPlaying: false });
-          lastDriftCorrectionAtRef.current = performanceTime;
-          lastSampleRef.current = { time: currentTime, performanceTime, isPlaying: false };
-          return;
-        }
-      }
       lastSampleRef.current = {
         time: currentTime,
         performanceTime,
-        isPlaying: state === window.YT.PlayerState.PLAYING,
+        isPlaying,
       };
     }, 750);
     socket.on("time-sync-response", onTimeSync);
@@ -357,7 +403,7 @@ export default function YouTubePlayer({ role, playback }) {
       window.clearInterval(seekTimer);
       socket.off("time-sync-response", onTimeSync);
     };
-  }, [getTargetTime]);
+  }, [getTargetTime, publishManualSeek]);
 
   useEffect(() => {
     const onApprovedPlayback = (approvedPlayback) => {
@@ -374,6 +420,19 @@ export default function YouTubePlayer({ role, playback }) {
   useEffect(() => {
     if (playback?.sourceUserId === socket.id && playback.sourceAction !== "change-video") {
       lastAppliedPlaybackRef.current = `${playback.videoId}:${playback.updatedAt ?? ""}`;
+      if (playback.sourceAction === "seek") {
+        const player = playerRef.current;
+        const time = Number(player?.getCurrentTime?.());
+        if (Number.isFinite(time)) {
+          lastSampleRef.current = {
+            time,
+            performanceTime: performance.now(),
+            isPlaying: playback.isPlaying,
+          };
+        }
+        lastDriftCorrectionAtRef.current = performance.now();
+        driftCorrectionArmedRef.current = false;
+      }
       return;
     }
     syncPlayer();
@@ -384,7 +443,9 @@ export default function YouTubePlayer({ role, playback }) {
     if (!canControl || !player || !readyRef.current) return;
     const state = player.getPlayerState();
     const time = player.getCurrentTime();
-    const action = state === window.YT.PlayerState.PLAYING ? "pause" : "play";
+    const isPlaying = state === window.YT.PlayerState.PLAYING
+      || (state === window.YT.PlayerState.BUFFERING && playbackRef.current?.isPlaying);
+    const action = isPlaying ? "pause" : "play";
     pendingSyncRef.current = {
       expectedState: action === "play" ? window.YT.PlayerState.PLAYING : window.YT.PlayerState.PAUSED,
       expiresAt: Date.now() + 5000,
