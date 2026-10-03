@@ -312,7 +312,7 @@ VITE_SOCKET_URL=https://your-backend-domain.example
 ## Live deployment URL
 
 Live URL:
-TODO — deploy before submission
+https://youtube-watch-party-1-w156.onrender.com/
 
 ## Notes
 
