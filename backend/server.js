@@ -18,7 +18,7 @@ const io = new Server(server, {
 });
 
 const rooms = new Map();
-const MAX_ROOM_USERS = 20;
+const MAX_ROOM_USERS = 50;
 const ROOM_TTL_MS = 30 * 60 * 1000;
 const USER_RECONNECT_GRACE_MS = 2 * 60 * 1000;
 let isShuttingDown = false;
